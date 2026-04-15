@@ -1,18 +1,17 @@
-from fastapi import FastAPI, Depends, HTTPException
+from fastapi import FastAPI, Depends, Query
 from fastapi.middleware.cors import CORSMiddleware
-from fastapi.responses import JSONResponse
+from fastapi.responses import JSONResponse, Response
+from pydantic import BaseModel
 import httpx
 import asyncio
 from sqlalchemy.orm import Session
-from datetime import datetime
-# import uuid7
+from typing import Optional
 
 from database import Profile, get_db
-from schemas import ProfileCreate, ProfileResponse, ErrorResponse
 
 app = FastAPI(title="HNG Stage 1 - Profiles API")
 
-# CORS - Very Important for grading bot
+# ── CORS — required for grading bot ──────────────────────────────────────────
 app.add_middleware(
     CORSMiddleware,
     allow_origins=["*"],
@@ -22,23 +21,37 @@ app.add_middleware(
 )
 
 
-async def call_genderize(name: str):
-    async with httpx.AsyncClient() as client:
+# ── Request schema ────────────────────────────────────────────────────────────
+# Pydantic handles 422 automatically when name is wrong type (e.g. int, bool)
+# 400 is handled manually for missing/empty string
+class ProfileCreate(BaseModel):
+    name: str
+
+
+# ── External API calls ────────────────────────────────────────────────────────
+
+async def call_genderize(name: str) -> dict:
+    async with httpx.AsyncClient(timeout=10.0) as client:
         r = await client.get(f"https://api.genderize.io/?name={name}")
+        r.raise_for_status()
         return r.json()
 
 
-async def call_agify(name: str):
-    async with httpx.AsyncClient() as client:
+async def call_agify(name: str) -> dict:
+    async with httpx.AsyncClient(timeout=10.0) as client:
         r = await client.get(f"https://api.agify.io/?name={name}")
+        r.raise_for_status()
         return r.json()
 
 
-async def call_nationalize(name: str):
-    async with httpx.AsyncClient() as client:
+async def call_nationalize(name: str) -> dict:
+    async with httpx.AsyncClient(timeout=10.0) as client:
         r = await client.get(f"https://api.nationalize.io/?name={name}")
+        r.raise_for_status()
         return r.json()
 
+
+# ── Helpers ───────────────────────────────────────────────────────────────────
 
 def get_age_group(age: int) -> str:
     if age <= 12:
@@ -51,126 +64,193 @@ def get_age_group(age: int) -> str:
         return "senior"
 
 
-@app.post("/api/profiles")
+def fmt_datetime(dt) -> str:
+    """Always return UTC ISO 8601 with Z suffix: 2026-04-01T12:00:00Z"""
+    return dt.strftime("%Y-%m-%dT%H:%M:%SZ")
+
+
+def serialize_profile_full(p: Profile) -> dict:
+    """Full profile — used in POST and GET /api/profiles/{id}"""
+    return {
+        "id": p.id,
+        "name": p.name,
+        "gender": p.gender,
+        "gender_probability": p.gender_probability,
+        "sample_size": p.sample_size,
+        "age": p.age,
+        "age_group": p.age_group,
+        "country_id": p.country_id,
+        "country_probability": p.country_probability,
+        "created_at": fmt_datetime(p.created_at),
+    }
+
+
+def serialize_profile_list(p: Profile) -> dict:
+    """Reduced fields — used in GET /api/profiles list"""
+    return {
+        "id": p.id,
+        "name": p.name,
+        "gender": p.gender,
+        "age": p.age,
+        "age_group": p.age_group,
+        "country_id": p.country_id,
+    }
+
+
+# ── POST /api/profiles ────────────────────────────────────────────────────────
+
+@app.post("/api/profiles", status_code=201)
 async def create_profile(payload: ProfileCreate, db: Session = Depends(get_db)):
-    
-    # ====================== VALIDATION FIRST ======================
-    if payload.name is None:
-        return JSONResponse(
-            status_code=400,
-            content={"status": "error", "message": "name parameter is required"}
-        )
 
-    name = str(payload.name).strip().lower()
-
+    # 400 — empty string after stripping
+    name = payload.name.strip().lower()
     if not name:
         return JSONResponse(
             status_code=400,
-            content={"status": "error", "message": "name cannot be empty"}
+            content={"status": "error", "message": "name cannot be empty"},
         )
 
-    if len(name) > 100:
-        return JSONResponse(
-            status_code=400,
-            content={"status": "error", "message": "name is too long (max 100 characters)"}
-        )
-    # ============================================================
-
-    # Now check idempotency (only for valid names)
+    # Idempotency — return existing profile without calling external APIs
     existing = db.query(Profile).filter(Profile.name == name).first()
     if existing:
-        return {
-            "status": "success",
-            "message": "Profile already exists",
-            "data": {
-                "id": existing.id,
-                "name": existing.name,
-                "gender": existing.gender,
-                "gender_probability": existing.gender_probability,
-                "sample_size": existing.sample_size,
-                "age": existing.age,
-                "age_group": existing.age_group,
-                "country_id": existing.country_id,
-                "country_probability": existing.country_probability,
-                "created_at": existing.created_at.isoformat().replace("+00:00", "Z")
-            }
-        }
+        return JSONResponse(
+            status_code=200,
+            content={
+                "status": "success",
+                "message": "Profile already exists",
+                "data": serialize_profile_full(existing),
+            },
+        )
 
-    # ... rest of your code (API calls, processing, etc.) remains the same
-
+    # Call all 3 APIs concurrently
     try:
-        # Call 3 APIs concurrently
         gender_data, age_data, nation_data = await asyncio.gather(
             call_genderize(name),
             call_agify(name),
-            call_nationalize(name)
+            call_nationalize(name),
         )
-        # Debug: Print errors
-        print("Genderize:", gender_data)
-        print("Agify:", age_data)
-        print("Nationalize:", nation_data)
-
-        # Check for exceptions
-        if isinstance(gender_data, Exception) or isinstance(age_data, Exception) or isinstance(nation_data, Exception):
-            raise Exception("One or more APIs failed")
-
-        # Edge Cases
-        if not gender_data.get("gender") or gender_data.get("count", 0) == 0:
-            return JSONResponse(status_code=422, content={
-                "status": "error", 
-                "message": "No prediction available for the provided name"
-            })
-
-        if age_data.get("age") is None:
-            return JSONResponse(status_code=422, content={
-                "status": "error", 
-                "message": "Could not determine age"
-            })
-
-        if not nation_data.get("country"):
-            return JSONResponse(status_code=422, content={
-                "status": "error", 
-                "message": "Could not determine country"
-            })
-
-        # Best country
-        best_country = max(nation_data["country"], key=lambda x: x["probability"])
-
-        # Create Profile
-        profile = Profile(
-            name=name,
-            gender=gender_data["gender"],
-            gender_probability=round(float(gender_data["probability"]), 2),
-            sample_size=int(gender_data["count"]),
-            age=int(age_data["age"]),
-            age_group=get_age_group(age_data["age"]),
-            country_id=best_country["country_id"],
-            country_probability=round(float(best_country["probability"]), 2),
+    except httpx.HTTPError:
+        return JSONResponse(
+            status_code=502,
+            content={"status": "error", "message": "Failed to reach external APIs"},
         )
 
-        db.add(profile)
-        db.commit()
-        db.refresh(profile)
+    # 502 — Genderize: gender is null OR count is 0
+    if not gender_data.get("gender") or gender_data.get("count", 0) == 0:
+        return JSONResponse(
+            status_code=502,
+            content={
+                "status": "502",
+                "message": "Genderize returned an invalid response",
+            },
+        )
 
-        return {
+    # 502 — Agify: age is null
+    if age_data.get("age") is None:
+        return JSONResponse(
+            status_code=502,
+            content={
+                "status": "502",
+                "message": "Agify returned an invalid response",
+            },
+        )
+
+    # 502 — Nationalize: empty country list
+    if not nation_data.get("country"):
+        return JSONResponse(
+            status_code=502,
+            content={
+                "status": "502",
+                "message": "Nationalize returned an invalid response",
+            },
+        )
+
+    # Pick country with highest probability
+    best_country = max(nation_data["country"], key=lambda x: x["probability"])
+
+    profile = Profile(
+        name=name,
+        gender=gender_data["gender"],
+        gender_probability=round(float(gender_data["probability"]), 2),
+        sample_size=int(gender_data["count"]),
+        age=int(age_data["age"]),
+        age_group=get_age_group(int(age_data["age"])),
+        country_id=best_country["country_id"],
+        country_probability=round(float(best_country["probability"]), 2),
+    )
+
+    db.add(profile)
+    db.commit()
+    db.refresh(profile)
+
+    return JSONResponse(
+        status_code=201,
+        content={"status": "success", "data": serialize_profile_full(profile)},
+    )
+
+
+# ── GET /api/profiles/{id} ────────────────────────────────────────────────────
+
+@app.get("/api/profiles/{profile_id}")
+def get_profile(profile_id: str, db: Session = Depends(get_db)):
+    profile = db.query(Profile).filter(Profile.id == profile_id).first()
+
+    if not profile:
+        return JSONResponse(
+            status_code=404,
+            content={"status": "error", "message": "Profile not found"},
+        )
+
+    return JSONResponse(
+        status_code=200,
+        content={"status": "success", "data": serialize_profile_full(profile)},
+    )
+
+
+# ── GET /api/profiles ─────────────────────────────────────────────────────────
+
+@app.get("/api/profiles")
+def list_profiles(
+    gender: Optional[str] = Query(default=None),
+    country_id: Optional[str] = Query(default=None),
+    age_group: Optional[str] = Query(default=None),
+    db: Session = Depends(get_db),
+):
+    query = db.query(Profile)
+
+    # Case-insensitive filtering as required by spec
+    if gender:
+        query = query.filter(Profile.gender.ilike(gender.strip()))
+    if country_id:
+        query = query.filter(Profile.country_id.ilike(country_id.strip()))
+    if age_group:
+        query = query.filter(Profile.age_group.ilike(age_group.strip()))
+
+    profiles = query.all()
+
+    return JSONResponse(
+        status_code=200,
+        content={
             "status": "success",
-            "data": {
-                "id": profile.id,
-                "name": profile.name,
-                "gender": profile.gender,
-                "gender_probability": profile.gender_probability,
-                "sample_size": profile.sample_size,
-                "age": profile.age,
-                "age_group": profile.age_group,
-                "country_id": profile.country_id,
-                "country_probability": profile.country_probability,
-                "created_at": profile.created_at.isoformat().replace("+00:00", "Z")
-            }
-        }
+            "count": len(profiles),
+            "data": [serialize_profile_list(p) for p in profiles],
+        },
+    )
 
-    except Exception as e:
-        print("Error occurred:", str(e))   # For debugging
-        return JSONResponse(status_code=502, content={
-            "status": "error",
-            "message": "Failed to fetch data from external APIs"
-        })
+
+# ── DELETE /api/profiles/{id} ─────────────────────────────────────────────────
+
+@app.delete("/api/profiles/{profile_id}", status_code=204)
+def delete_profile(profile_id: str, db: Session = Depends(get_db)):
+    profile = db.query(Profile).filter(Profile.id == profile_id).first()
+
+    if not profile:
+        return JSONResponse(
+            status_code=404,
+            content={"status": "error", "message": "Profile not found"},
+        )
+
+    db.delete(profile)
+    db.commit()
+
+    return Response(status_code=204)

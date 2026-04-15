@@ -2,6 +2,6 @@ fastapi
 uvicorn[standard]
 httpx
 sqlalchemy
-alembic
+psycopg2-binary
 python-dotenv
-uuid7
+uuid6
