@@ -412,28 +412,4 @@ test_main.py::test_delete_profile_not_found     PASSED
 | `test_search_valid_query` | Valid NL query returns 200 with pagination fields |
 | `test_delete_profile_not_found` | Deleting unknown ID returns 404 |
 
----
 
-## Logging
-
-The application uses Python's built-in `logging` module for structured output.
-Logs appear in your terminal locally and in Railway's deployment logs in production.
-
-### Log levels used
-
-| Level | When |
-|---|---|
-| `INFO` | Normal events — profile created, API called, profile already exists |
-| `WARNING` | Unexpected but recoverable situations |
-| `ERROR` | External API failures, timeouts, database errors |
-
-### Example log output
-
-```
-INFO:main:External APIs called successfully for name: ella
-INFO:main:Profile created successfully for name: ella, id: 019526b2-...
-INFO:main:Profile already exists for name: ella
-ERROR:main:External API timeout for name: xyz
-```
-
-Sensitive data such as passwords, tokens, and full request bodies are never logged.
