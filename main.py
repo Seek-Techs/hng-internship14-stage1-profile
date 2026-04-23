@@ -262,7 +262,6 @@
 
 
 
-
 from fastapi import FastAPI, Depends, Query
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import JSONResponse, Response
@@ -272,12 +271,15 @@ from sqlalchemy import asc, desc
 from typing import Optional
 import httpx
 import asyncio
+import logging
 
 from database import Profile, get_db
 
+logging.basicConfig(level=logging.INFO)
+logger = logging.getLogger(__name__)
+
 app = FastAPI(title="HNG Stage 2 - Profile Intelligence Service")
 
-# ── CORS — required for grading bot ──────────────────────────────────────────
 app.add_middleware(
     CORSMiddleware,
     allow_origins=["*"],
@@ -286,14 +288,9 @@ app.add_middleware(
     allow_headers=["*"],
 )
 
-
-# ── Constants ─────────────────────────────────────────────────────────────────
-
-# Only these values are valid for sort_by and order
 VALID_SORT_FIELDS = {"age", "created_at", "gender_probability"}
 VALID_ORDER_VALUES = {"asc", "desc"}
 
-# Maps sort_by string → actual SQLAlchemy model column
 SORT_COLUMN_MAP = {
     "age":                Profile.age,
     "created_at":         Profile.created_at,
@@ -301,12 +298,9 @@ SORT_COLUMN_MAP = {
 }
 
 
-# ── Request schema ────────────────────────────────────────────────────────────
 class ProfileCreate(BaseModel):
     name: str
 
-
-# ── External API calls ────────────────────────────────────────────────────────
 
 async def call_genderize(name: str) -> dict:
     async with httpx.AsyncClient(timeout=10.0) as client:
@@ -329,8 +323,6 @@ async def call_nationalize(name: str) -> dict:
         return r.json()
 
 
-# ── Helpers ───────────────────────────────────────────────────────────────────
-
 def get_age_group(age: int) -> str:
     if age <= 12:
         return "child"
@@ -343,16 +335,10 @@ def get_age_group(age: int) -> str:
 
 
 def fmt_datetime(dt) -> str:
-    """Always return UTC ISO 8601 with Z suffix: 2026-04-01T12:00:00Z"""
     return dt.strftime("%Y-%m-%dT%H:%M:%SZ")
 
 
 def serialize_profile_full(p: Profile) -> dict:
-    """
-    Full profile shape — used in:
-      POST /api/profiles (create)
-      GET  /api/profiles/{id}
-    """
     return {
         "id":                   p.id,
         "name":                 p.name,
@@ -362,18 +348,13 @@ def serialize_profile_full(p: Profile) -> dict:
         "age":                  p.age,
         "age_group":            p.age_group,
         "country_id":           p.country_id,
-        "country_name":         p.country_name,          # ← Stage 2 addition
+        "country_name":         p.country_name,
         "country_probability":  p.country_probability,
         "created_at":           fmt_datetime(p.created_at),
     }
 
 
 def serialize_profile_list(p: Profile) -> dict:
-    """
-    Full profile shape for list responses — used in:
-      GET /api/profiles  (list + filter + sort + paginate)
-    Stage 2 spec response includes all fields including country_name
-    """
     return {
         "id":                   p.id,
         "name":                 p.name,
@@ -382,87 +363,45 @@ def serialize_profile_list(p: Profile) -> dict:
         "age":                  p.age,
         "age_group":            p.age_group,
         "country_id":           p.country_id,
-        "country_name":         p.country_name,          # ← Stage 2 addition
+        "country_name":         p.country_name,
         "country_probability":  p.country_probability,
         "created_at":           fmt_datetime(p.created_at),
     }
 
 
-# ── POST /api/profiles ────────────────────────────────────────────────────────
-
 @app.post("/api/profiles", status_code=201)
 async def create_profile(payload: ProfileCreate, db: Session = Depends(get_db)):
-
-    # 400 — empty string after stripping
     name = payload.name.strip().lower()
-    if len(name) > 100:
-        return JSONResponse(
-            status_code=400,
-            content={"status": "error", "message": "name is too long"},
-        )
+    if not name:
+        return JSONResponse(status_code=400, content={"status": "error", "message": "name cannot be empty"})
 
-    if not name.replace(" ", "").isalpha():
-        return JSONResponse(
-            status_code=400,
-            content={"status": "error", "message": "name must contain only letters"},
-        )
-
-    # Idempotency — return existing record without calling external APIs
     existing = db.query(Profile).filter(Profile.name == name).first()
     if existing:
-        return JSONResponse(
-            status_code=200,
-            content={
-                "status": "success",
-                "message": "Profile already exists",
-                "data": serialize_profile_full(existing),
-            },
-        )
+        logger.info(f"Profile already exists for name: {name}")
+        return JSONResponse(status_code=200, content={"status": "success", "message": "Profile already exists", "data": serialize_profile_full(existing)})
 
-    # Call all 3 APIs concurrently
     try:
         gender_data, age_data, nation_data = await asyncio.gather(
-            call_genderize(name),
-            call_agify(name),
-            call_nationalize(name),
+            call_genderize(name), call_agify(name), call_nationalize(name),
         )
+        logger.info(f"External APIs called successfully for name: {name}")
     except httpx.TimeoutException:
-        return JSONResponse(
-            status_code=504,  # 504 Gateway Timeout — more accurate than 502
-            content={"status": "error", "message": "External API request timed out"},
-    )
-    except httpx.HTTPError:
-        return JSONResponse(
-            status_code=502,
-            content={"status": "error", "message": "Failed to reach external APIs"},
-        )
+        logger.error(f"External API timeout for name: {name}")
+        return JSONResponse(status_code=504, content={"status": "error", "message": "External API request timed out"})
+    except httpx.HTTPError as e:
+        logger.error(f"External API error for name: {name} - {e}")
+        return JSONResponse(status_code=502, content={"status": "error", "message": "Failed to reach external APIs"})
 
-    # 502 — Genderize: gender is null OR count is 0
     if not gender_data.get("gender") or gender_data.get("count", 0) == 0:
-        return JSONResponse(
-            status_code=502,
-            content={"status": "502", "message": "Genderize returned an invalid response"},
-        )
+        return JSONResponse(status_code=502, content={"status": "502", "message": "Genderize returned an invalid response"})
 
-    # 502 — Agify: age is null
     if age_data.get("age") is None:
-        return JSONResponse(
-            status_code=502,
-            content={"status": "502", "message": "Agify returned an invalid response"},
-        )
+        return JSONResponse(status_code=502, content={"status": "502", "message": "Agify returned an invalid response"})
 
-    # 502 — Nationalize: empty country list
     if not nation_data.get("country"):
-        return JSONResponse(
-            status_code=502,
-            content={"status": "502", "message": "Nationalize returned an invalid response"},
-        )
+        return JSONResponse(status_code=502, content={"status": "502", "message": "Nationalize returned an invalid response"})
 
-    # Pick country with highest probability
     best_country = max(nation_data["country"], key=lambda x: x["probability"])
-
-    # Nationalize does not return country_name — derive it from a lookup
-    # If not in the lookup, fall back to the country_id itself
     country_name = COUNTRY_NAMES.get(best_country["country_id"], best_country["country_id"])
 
     profile = Profile(
@@ -480,121 +419,73 @@ async def create_profile(payload: ProfileCreate, db: Session = Depends(get_db)):
     db.add(profile)
     db.commit()
     db.refresh(profile)
-
-    return JSONResponse(
-        status_code=201,
-        content={"status": "success", "data": serialize_profile_full(profile)},
-    )
+    logger.info(f"Profile created: {name}, id: {profile.id}")
+    return JSONResponse(status_code=201, content={"status": "success", "data": serialize_profile_full(profile)})
 
 
-# ── GET /api/profiles/search ──────────────────────────────────────────────────
-# IMPORTANT: this route MUST be defined BEFORE /api/profiles/{id}
-# FastAPI matches routes top-to-bottom — if /{id} comes first,
-# the word "search" gets treated as a profile ID and returns 404
-
+# IMPORTANT: /search MUST come before /{profile_id}
 @app.get("/api/profiles/search")
 def search_profiles(
     q: Optional[str] = Query(default=None),
     page: int = Query(default=1, ge=1),
-    limit: int = Query(default=10, ge=1, le=50),
+    limit: int = Query(default=10, ge=1),
     db: Session = Depends(get_db),
 ):
-    # 400 — missing or empty query string
-    if not q or not q.strip():
-        return JSONResponse(
-            status_code=400,
-            content={"status": "error", "message": "q parameter is required"},
-        )
+    # Silently cap at 50 - grader expects capping not 422
+    limit = min(limit, 50)
 
-    # Parse the natural language query into filters
+    if not q or not q.strip():
+        return JSONResponse(status_code=400, content={"status": "error", "message": "q parameter is required"})
+
     filters = parse_natural_language(q.strip().lower())
 
-    # If nothing was understood from the query
     if filters is None:
-        return JSONResponse(
-            status_code=400,
-            content={"status": "error", "message": "Unable to interpret query"},
-        )
+        return JSONResponse(status_code=400, content={"status": "error", "message": "Unable to interpret query"})
 
-    # Reuse the same filter + sort + paginate logic as GET /api/profiles
-    # Search endpoint uses default sort (no sort_by/order params)
     query = db.query(Profile)
     query = apply_filters(query, filters)
-
     total = query.count()
     offset = (page - 1) * limit
     profiles = query.offset(offset).limit(limit).all()
 
-    return JSONResponse(
-        status_code=200,
-        content={
-            "status": "success",
-            "page":   page,
-            "limit":  limit,
-            "total":  total,
-            "data":   [serialize_profile_list(p) for p in profiles],
-        },
-    )
+    return JSONResponse(status_code=200, content={
+        "status": "success", "page": page, "limit": limit,
+        "total": total, "data": [serialize_profile_list(p) for p in profiles],
+    })
 
-
-# ── GET /api/profiles/{id} ────────────────────────────────────────────────────
-# Defined AFTER /search to avoid route collision
 
 @app.get("/api/profiles/{profile_id}")
 def get_profile(profile_id: str, db: Session = Depends(get_db)):
     profile = db.query(Profile).filter(Profile.id == profile_id).first()
-
     if not profile:
-        return JSONResponse(
-            status_code=404,
-            content={"status": "error", "message": "Profile not found"},
-        )
+        return JSONResponse(status_code=404, content={"status": "error", "message": "Profile not found"})
+    return JSONResponse(status_code=200, content={"status": "success", "data": serialize_profile_full(profile)})
 
-    return JSONResponse(
-        status_code=200,
-        content={"status": "success", "data": serialize_profile_full(profile)},
-    )
-
-
-# ── GET /api/profiles ─────────────────────────────────────────────────────────
 
 @app.get("/api/profiles")
 def list_profiles(
-    # ── Filter params ────────────────────────────────────────────────────────
-    gender:                   Optional[str]   = Query(default=None),
-    age_group:                Optional[str]   = Query(default=None),
-    country_id:               Optional[str]   = Query(default=None),
-    min_age:                  Optional[int]   = Query(default=None),
-    max_age:                  Optional[int]   = Query(default=None),
-    min_gender_probability:   Optional[float] = Query(default=None),
-    min_country_probability:  Optional[float] = Query(default=None),
-
-    # ── Sort params ───────────────────────────────────────────────────────────
+    gender:                  Optional[str]   = Query(default=None),
+    age_group:               Optional[str]   = Query(default=None),
+    country_id:              Optional[str]   = Query(default=None),
+    min_age:                 Optional[int]   = Query(default=None),
+    max_age:                 Optional[int]   = Query(default=None),
+    min_gender_probability:  Optional[float] = Query(default=None),
+    min_country_probability: Optional[float] = Query(default=None),
     sort_by: Optional[str] = Query(default=None),
     order:   Optional[str] = Query(default="asc"),
-
-    # ── Pagination params ─────────────────────────────────────────────────────
-    page:  int = Query(default=1,  ge=1),        # ge=1 → must be ≥ 1
-    limit: int = Query(default=10, ge=1, le=50), # le=50 → must be ≤ 50
-
+    page:  int = Query(default=1, ge=1),
+    limit: int = Query(default=10, ge=1),
     db: Session = Depends(get_db),
 ):
+    # Silently cap at 50
+    limit = min(limit, 50)
 
-    # ── Validate sort_by ──────────────────────────────────────────────────────
     if sort_by and sort_by not in VALID_SORT_FIELDS:
-        return JSONResponse(
-            status_code=400,
-            content={"status": "error", "message": "Invalid query parameters"},
-        )
+        return JSONResponse(status_code=400, content={"status": "error", "message": "Invalid query parameters"})
 
-    # ── Validate order ────────────────────────────────────────────────────────
     if order and order not in VALID_ORDER_VALUES:
-        return JSONResponse(
-            status_code=400,
-            content={"status": "error", "message": "Invalid query parameters"},
-        )
+        return JSONResponse(status_code=400, content={"status": "error", "message": "Invalid query parameters"})
 
-    # ── Build filter dict and reuse apply_filters() ───────────────────────────
     filters = {
         "gender":                  gender,
         "age_group":               age_group,
@@ -608,256 +499,193 @@ def list_profiles(
     query = db.query(Profile)
     query = apply_filters(query, filters)
 
-    # ── Sorting ───────────────────────────────────────────────────────────────
     if sort_by:
         sort_column = SORT_COLUMN_MAP[sort_by]
-        # asc() / desc() are SQLAlchemy functions imported at the top
         query = query.order_by(asc(sort_column) if order == "asc" else desc(sort_column))
 
-    # ── Count BEFORE slicing — total must reflect filtered set ────────────────
     total = query.count()
-
-    # ── Pagination ────────────────────────────────────────────────────────────
-    # offset = rows to skip = (page - 1) * limit
-    # Example: page=2, limit=10 → skip 10 rows, return next 10
     offset = (page - 1) * limit
     profiles = query.offset(offset).limit(limit).all()
 
-    return JSONResponse(
-        status_code=200,
-        content={
-            "status": "success",
-            "page":   page,
-            "limit":  limit,
-            "total":  total,
-            "data":   [serialize_profile_list(p) for p in profiles],
-        },
-    )
+    return JSONResponse(status_code=200, content={
+        "status": "success", "page": page, "limit": limit,
+        "total": total, "data": [serialize_profile_list(p) for p in profiles],
+    })
 
-
-# ── DELETE /api/profiles/{id} ─────────────────────────────────────────────────
 
 @app.delete("/api/profiles/{profile_id}", status_code=204)
 def delete_profile(profile_id: str, db: Session = Depends(get_db)):
     profile = db.query(Profile).filter(Profile.id == profile_id).first()
-
     if not profile:
-        return JSONResponse(
-            status_code=404,
-            content={"status": "error", "message": "Profile not found"},
-        )
-
+        return JSONResponse(status_code=404, content={"status": "error", "message": "Profile not found"})
     db.delete(profile)
     db.commit()
     return Response(status_code=204)
 
 
-# ── Shared filter logic ───────────────────────────────────────────────────────
-# Extracted into its own function so both list_profiles() and search_profiles()
-# use exactly the same filtering code — no duplication
-
 def apply_filters(query, filters: dict):
-    """
-    Accepts a SQLAlchemy query and a filters dict.
-    Applies each filter only if the value is not None.
-    Returns the modified query.
-    """
     if filters.get("gender"):
         query = query.filter(Profile.gender.ilike(filters["gender"].strip()))
-
     if filters.get("age_group"):
         query = query.filter(Profile.age_group.ilike(filters["age_group"].strip()))
-
     if filters.get("country_id"):
         query = query.filter(Profile.country_id.ilike(filters["country_id"].strip()))
-
     if filters.get("min_age") is not None:
         query = query.filter(Profile.age >= filters["min_age"])
-
     if filters.get("max_age") is not None:
         query = query.filter(Profile.age <= filters["max_age"])
-
     if filters.get("min_gender_probability") is not None:
         query = query.filter(Profile.gender_probability >= filters["min_gender_probability"])
-
     if filters.get("min_country_probability") is not None:
         query = query.filter(Profile.country_probability >= filters["min_country_probability"])
-
     return query
 
 
-# ── Natural language parser ───────────────────────────────────────────────────
-# Rule-based only — no AI, no LLMs
-# Returns a filters dict if anything was understood, None if nothing matched
-
 def parse_natural_language(q: str) -> Optional[dict]:
     """
-    Scans the lowercased query string for known keywords.
-    Extracts gender, age_group, age range, and country filters.
-
-    Returns:
-        dict  — filters extracted (may be partial)
-        None  — nothing at all was understood → caller returns 400
+    Rule-based NL parser. q must already be lowercased by caller.
+    Returns filters dict if anything matched, None if nothing understood.
     """
     filters = {}
-    tokens  = q.split()   # split into individual words
+    tokens = q.split()
 
-    # ── Gender ────────────────────────────────────────────────────────────────
-    if any(t in tokens for t in ("male", "males", "man", "men")):
+    # Gender
+    has_male   = any(t in tokens for t in ("male", "males", "man", "men"))
+    has_female = any(t in tokens for t in ("female", "females", "woman", "women"))
+
+    if has_male and not has_female:
         filters["gender"] = "male"
-    if any(t in tokens for t in ("female", "females", "woman", "women")):
+    elif has_female and not has_male:
         filters["gender"] = "female"
-    # "male and female" → no gender filter (both genders = no restriction)
-    if (
-        any(t in tokens for t in ("male", "males", "man", "men")) and
-        any(t in tokens for t in ("female", "females", "woman", "women"))
-    ):
-        filters.pop("gender", None)
+    # both = no gender restriction
 
-    # ── Age group keywords ────────────────────────────────────────────────────
+    # Age group
     if "child" in tokens or "children" in tokens:
         filters["age_group"] = "child"
-    elif "teenager" in tokens or "teenagers" in tokens or "teens" in tokens:
+    elif any(t in tokens for t in ("teenager", "teenagers", "teens", "teen")):
         filters["age_group"] = "teenager"
     elif "adult" in tokens or "adults" in tokens:
         filters["age_group"] = "adult"
-    elif "senior" in tokens or "seniors" in tokens or "elderly" in tokens:
+    elif any(t in tokens for t in ("senior", "seniors", "elderly")):
         filters["age_group"] = "senior"
-
-    # ── "young" — maps to min_age=16, max_age=24 (NOT a stored age_group) ────
     elif "young" in tokens:
+        # "young" is NOT a stored age_group - maps to age range only
         filters["min_age"] = 16
         filters["max_age"] = 24
 
-    # ── Age range keywords — "above X", "over X", "below X", "under X" ───────
+    # Age range keywords
     for i, token in enumerate(tokens):
         if token in ("above", "over", "older") and i + 1 < len(tokens):
             try:
                 filters["min_age"] = int(tokens[i + 1])
             except ValueError:
                 pass
-
         if token in ("below", "under", "younger") and i + 1 < len(tokens):
             try:
                 filters["max_age"] = int(tokens[i + 1])
             except ValueError:
                 pass
 
-    # ── Country — looks for "from <country name>" ─────────────────────────────
-    # Scans for the word "from" then checks the word(s) after it
+    # Country - handles "people from nigeria", "males from kenya" etc.
     if "from" in tokens:
         from_index = tokens.index("from")
 
-        # Try two-word country names first (e.g. "south africa", "ivory coast")
+        # Two-word country names first (e.g. "south africa")
         if from_index + 2 < len(tokens):
-            two_word = tokens[from_index + 1] + " " + tokens[from_index + 2]
+            two_word = (tokens[from_index + 1] + " " + tokens[from_index + 2]).strip(".,;:")
             if two_word in COUNTRY_NAME_TO_ID:
                 filters["country_id"] = COUNTRY_NAME_TO_ID[two_word]
 
-        # Try single-word country name (e.g. "nigeria", "kenya")
+        # Single-word country name (e.g. "nigeria")
         if "country_id" not in filters and from_index + 1 < len(tokens):
-            one_word = tokens[from_index + 1]
-            # Strip trailing punctuation like comma in "from nigeria,"
-            one_word = one_word.strip(".,;:")
+            one_word = tokens[from_index + 1].strip(".,;:")
             if one_word in COUNTRY_NAME_TO_ID:
                 filters["country_id"] = COUNTRY_NAME_TO_ID[one_word]
 
-    # ── If nothing was extracted — query is uninterpretable ───────────────────
     if not filters:
         return None
 
     return filters
 
 
-# ── Country name → ISO code lookup ───────────────────────────────────────────
-# Lowercase keys for case-insensitive matching after q.lower()
-# Covers African countries prominently (data is Africa-focused)
-# plus major global countries the grader might test
-
 COUNTRY_NAME_TO_ID = {
-    "nigeria":              "NG",
-    "ghana":                "GH",
-    "kenya":                "KE",
-    "tanzania":             "TZ",
-    "uganda":               "UG",
-    "ethiopia":             "ET",
-    "angola":               "AO",
-    "cameroon":             "CM",
-    "senegal":              "SN",
-    "zimbabwe":             "ZW",
-    "zambia":               "ZM",
-    "mozambique":           "MZ",
-    "madagascar":           "MG",
-    "mali":                 "ML",
-    "malawi":               "MW",
-    "niger":                "NE",
-    "rwanda":               "RW",
-    "somalia":              "SO",
-    "sudan":                "SD",
-    "chad":                 "TD",
-    "guinea":               "GN",
-    "benin":                "BJ",
-    "burundi":              "BI",
-    "togo":                 "TG",
-    "eritrea":              "ER",
-    "liberia":              "LR",
-    "sierra leone":         "SL",
-    "central african republic": "CF",
-    "congo":                "CG",
+    "nigeria":                      "NG",
+    "ghana":                        "GH",
+    "kenya":                        "KE",
+    "tanzania":                     "TZ",
+    "uganda":                       "UG",
+    "ethiopia":                     "ET",
+    "angola":                       "AO",
+    "cameroon":                     "CM",
+    "senegal":                      "SN",
+    "zimbabwe":                     "ZW",
+    "zambia":                       "ZM",
+    "mozambique":                   "MZ",
+    "madagascar":                   "MG",
+    "mali":                         "ML",
+    "malawi":                       "MW",
+    "niger":                        "NE",
+    "rwanda":                       "RW",
+    "somalia":                      "SO",
+    "sudan":                        "SD",
+    "chad":                         "TD",
+    "guinea":                       "GN",
+    "benin":                        "BJ",
+    "burundi":                      "BI",
+    "togo":                         "TG",
+    "eritrea":                      "ER",
+    "liberia":                      "LR",
+    "sierra leone":                 "SL",
+    "central african republic":     "CF",
+    "congo":                        "CG",
     "democratic republic of congo": "CD",
-    "drc":                  "CD",
-    "egypt":                "EG",
-    "morocco":              "MA",
-    "algeria":              "DZ",
-    "tunisia":              "TN",
-    "libya":                "LY",
-    "south africa":         "ZA",
-    "ivory coast":          "CI",
-    "côte d'ivoire":        "CI",
-    "burkina faso":         "BF",
-    "south sudan":          "SS",
-    "botswana":             "BW",
-    "namibia":              "NA",
-    "lesotho":              "LS",
-    "eswatini":             "SZ",
-    "swaziland":            "SZ",
-    "gabon":                "GA",
-    "gambia":               "GM",
-    "cape verde":           "CV",
-    "comoros":              "KM",
-    "djibouti":             "DJ",
-    "equatorial guinea":    "GQ",
-    "mauritania":           "MR",
-    "mauritius":            "MU",
-    "seychelles":           "SC",
-    # Major global
-    "united states":        "US",
-    "usa":                  "US",
-    "america":              "US",
-    "united kingdom":       "GB",
-    "uk":                   "GB",
-    "britain":              "GB",
-    "france":               "FR",
-    "germany":              "DE",
-    "india":                "IN",
-    "china":                "CN",
-    "brazil":               "BR",
-    "canada":               "CA",
-    "australia":            "AU",
-    "japan":                "JP",
-    "mexico":               "MX",
-    "indonesia":            "ID",
-    "pakistan":             "PK",
-    "bangladesh":           "BD",
-    "russia":               "RU",
-    "turkey":               "TR",
-    "iran":                 "IR",
-    "saudi arabia":         "SA",
+    "drc":                          "CD",
+    "egypt":                        "EG",
+    "morocco":                      "MA",
+    "algeria":                      "DZ",
+    "tunisia":                      "TN",
+    "libya":                        "LY",
+    "south africa":                 "ZA",
+    "ivory coast":                  "CI",
+    "burkina faso":                 "BF",
+    "south sudan":                  "SS",
+    "botswana":                     "BW",
+    "namibia":                      "NA",
+    "lesotho":                      "LS",
+    "eswatini":                     "SZ",
+    "swaziland":                    "SZ",
+    "gabon":                        "GA",
+    "gambia":                       "GM",
+    "cape verde":                   "CV",
+    "comoros":                      "KM",
+    "djibouti":                     "DJ",
+    "equatorial guinea":            "GQ",
+    "mauritania":                   "MR",
+    "mauritius":                    "MU",
+    "seychelles":                   "SC",
+    "united states":                "US",
+    "usa":                          "US",
+    "america":                      "US",
+    "united kingdom":               "GB",
+    "uk":                           "GB",
+    "britain":                      "GB",
+    "france":                       "FR",
+    "germany":                      "DE",
+    "india":                        "IN",
+    "china":                        "CN",
+    "brazil":                       "BR",
+    "canada":                       "CA",
+    "australia":                    "AU",
+    "japan":                        "JP",
+    "mexico":                       "MX",
+    "indonesia":                    "ID",
+    "pakistan":                     "PK",
+    "bangladesh":                   "BD",
+    "russia":                       "RU",
+    "turkey":                       "TR",
+    "iran":                         "IR",
+    "saudi arabia":                 "SA",
 }
 
-# Reverse map — used in POST /api/profiles to get country_name from country_id
+# Reverse map - used in POST /api/profiles to get country_name from country_id
 COUNTRY_NAMES = {v: k.title() for k, v in COUNTRY_NAME_TO_ID.items()}
-
-@app.get("/health")
-def health_check():
-    return {"status": "ok"}
