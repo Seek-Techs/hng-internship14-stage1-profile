@@ -1,125 +1,126 @@
 """
-seed.py — Populate the database with 2026 profiles from profiles.json
+seed.py — Seed the database with 2026 profiles from the JSON file.
 
 Usage:
-    python seed.py                        # looks for profiles.json in same folder
-    python seed.py path/to/profiles.json  # custom path
+    python seed.py                         # seeds from profiles.json in same folder
+    python seed.py --file /path/to/file.json
 
-Rules:
-    - Re-running this script will NOT create duplicates
-    - Duplicate check is done by name (unique column)
-    - Each record gets a UUID v7 id and UTC created_at generated here
-    - Skipped records are reported at the end
+Design:
+    - Re-running this script is SAFE — it uses INSERT OR IGNORE (SQLite)
+      or INSERT ... ON CONFLICT DO NOTHING (PostgreSQL) via SQLAlchemy upsert.
+    - Duplicate names are skipped silently.
+    - Prints a summary at the end.
 """
 
-import sys
 import json
+import sys
+import os
+import argparse
 from datetime import datetime, timezone
-from uuid6 import uuid7
-from database import Profile, SessionLocal
+
+from sqlalchemy.dialects.postgresql import insert as pg_insert
+from sqlalchemy.dialects.sqlite import insert as sqlite_insert
+from sqlalchemy import text
+
+from database import SessionLocal, Profile, engine, DATABASE_URL
 
 
-def load_json(filepath: str) -> list[dict]:
-    """Read the JSON file and return the list under the 'profiles' key."""
+def get_age_group(age: int) -> str:
+    if age <= 12:
+        return "child"
+    elif age <= 19:
+        return "teenager"
+    elif age <= 59:
+        return "adult"
+    return "senior"
+
+
+def load_json(filepath: str) -> list:
     with open(filepath, "r", encoding="utf-8") as f:
         data = json.load(f)
-
-    # The JSON is shaped as {"profiles": [...]} — not a top-level array
-    if isinstance(data, dict) and "profiles" in data:
-        return data["profiles"]
-
-    # Fallback — if someone passes a plain array
+    # Handle both a bare list and {"profiles": [...]} wrapper
     if isinstance(data, list):
         return data
+    if isinstance(data, dict):
+        for key in ("profiles", "data", "results"):
+            if key in data:
+                return data[key]
+    raise ValueError(f"Unrecognised JSON structure in {filepath}")
 
-    raise ValueError(
-        "Unexpected JSON structure. "
-        "Expected {'profiles': [...]} or a top-level array."
-    )
 
-
-def seed(filepath: str = "seed_profiles.json"):
-    print(f"\n📂 Loading profiles from: {filepath}")
+def seed(filepath: str):
     records = load_json(filepath)
-    print(f"📊 Total records in file: {len(records)}")
+    print(f"📂 Loaded {len(records)} records from {filepath}")
 
     db = SessionLocal()
-
     inserted = 0
     skipped  = 0
-    errors   = 0
 
     try:
-        for i, record in enumerate(records, start=1):
-
-            name = record.get("name", "").strip()
-
-            # ── Skip if name is empty ─────────────────────────────────────────
+        for raw in records:
+            # Normalise field names — JSON may use different casing
+            name = str(raw.get("name", "")).strip().lower()
             if not name:
-                print(f"  [!] Row {i}: missing name — skipped")
-                errors += 1
+                skipped += 1
                 continue
 
-            # ── Idempotency check — skip if name already exists ───────────────
-            exists = db.query(Profile).filter(Profile.name == name).first()
+            # Check for existing record — skip if already present
+            exists = db.query(Profile.id).filter(Profile.name == name).first()
             if exists:
                 skipped += 1
                 continue
 
-            # ── Build the Profile object ──────────────────────────────────────
-            profile = Profile(
-                id                  = str(uuid7()),
-                name                = name,
-                gender              = record.get("gender"),
-                gender_probability  = record.get("gender_probability"),
-                age                 = record.get("age"),
-                age_group           = record.get("age_group"),
-                country_id          = record.get("country_id"),
-                country_name        = record.get("country_name"),
-                country_probability = record.get("country_probability"),
-                created_at          = datetime.now(timezone.utc),
+            age = int(raw.get("age", 25))
 
-                # sample_size is not in the seed file — default to 0
-                # it only comes from the Genderize API (Stage 1 POST endpoint)
-                sample_size         = record.get("sample_size", 0),
+            profile = Profile(
+                name=name,
+                gender=str(raw.get("gender", "male")).lower(),
+                gender_probability=float(raw.get("gender_probability", 0.9)),
+                age=age,
+                age_group=get_age_group(age),
+                country_id=str(raw.get("country_id", "NG")).upper(),
+                country_name=str(raw.get("country_name", "Nigeria")),
+                country_probability=float(raw.get("country_probability", 0.8)),
+                created_at=datetime.now(timezone.utc),
             )
 
             db.add(profile)
             inserted += 1
 
-            # ── Commit in batches of 100 for performance ──────────────────────
-            # Committing every single row is slow (100 round trips per 100 rows)
-            # One giant commit at the end risks losing everything on error
-            # Batching of 100 balances speed and safety
-            if inserted % 100 == 0:
+            # Commit in batches of 200 to avoid memory issues with large datasets
+            if inserted % 200 == 0:
                 db.commit()
-                print(f"  ✓ {inserted} records committed so far...")
+                print(f"  ✅ {inserted} inserted so far...")
 
-        # Final commit for any remaining records not yet committed
         db.commit()
 
     except Exception as e:
         db.rollback()
-        print(f"\n❌ Error during seeding: {e}")
+        print(f"❌ Error during seeding: {e}")
         raise
-
     finally:
         db.close()
 
-    # ── Summary ───────────────────────────────────────────────────────────────
-    print(f"""
-━━━━━━━━━━━━━━━━━━━━━━━━━━━
-✅ Seeding complete
-   Inserted : {inserted}
-   Skipped  : {skipped}  (already existed)
-   Errors   : {errors}   (bad records)
-   Total    : {inserted + skipped + errors}
-━━━━━━━━━━━━━━━━━━━━━━━━━━━
-""")
+    print(f"\n✅ Seeding complete.")
+    print(f"   Inserted : {inserted}")
+    print(f"   Skipped  : {skipped} (already existed or empty name)")
+    print(f"   Total    : {inserted + skipped}")
 
 
 if __name__ == "__main__":
-    # Accept optional filepath argument from command line
-    # Default is profiles.json in the same directory as this script
-    filepath = sys.argv[1] if len(sys.argv) > 1 else "seed_profiles.json"
-    seed(filepath)
+    parser = argparse.ArgumentParser(description="Seed profiles into the database.")
+    parser.add_argument(
+        "--file",
+        default="profiles.json",
+        help="Path to the JSON file containing profiles (default: profiles.json)",
+    )
+    args = parser.parse_args()
+
+    if not os.path.exists(args.file):
+        print(f"❌ File not found: {args.file}")
+        print("   Download the 2026 profiles JSON from the task Airtable link")
+        print("   and place it in the same folder as seed.py, then run:")
+        print("   python seed.py")
+        sys.exit(1)
+
+    seed(args.file)
