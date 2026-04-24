@@ -95,6 +95,8 @@ class Profile(Base):
         Index("ix_profiles_gender_country", "gender", "country_id"),
     )
 
+
+
 # Base.metadata.create_all(bind=engine)
 def init_db():
     Base.metadata.create_all(bind=engine)
