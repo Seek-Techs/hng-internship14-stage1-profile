@@ -19,6 +19,12 @@ app.add_middleware(
 )
 
 
+from database import init_db
+
+@app.on_event("startup")
+def on_startup():
+    init_db()
+
 # ─────────────────────────────────────────────
 # GLOBAL ERROR HANDLERS
 # All errors must return {"status": "error", "message": "..."}

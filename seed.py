@@ -16,11 +16,13 @@ import json
 import sys
 import os
 import argparse
+from uuid6 import uuid7
 from datetime import datetime, timezone
 
 from sqlalchemy.dialects.postgresql import insert as pg_insert
 from sqlalchemy.dialects.sqlite import insert as sqlite_insert
 from sqlalchemy import text
+from sqlalchemy.dialects.postgresql import insert
 
 from database import SessionLocal, Profile, engine, DATABASE_URL
 
@@ -53,58 +55,53 @@ def seed(filepath: str):
     print(f"📂 Loaded {len(records)} records from {filepath}")
 
     db = SessionLocal()
-    inserted = 0
-    skipped  = 0
 
     try:
+        batch = []
+
         for raw in records:
-            # Normalise field names — JSON may use different casing
             name = str(raw.get("name", "")).strip().lower()
             if not name:
-                skipped += 1
-                continue
-
-            # Check for existing record — skip if already present
-            exists = db.query(Profile.id).filter(Profile.name == name).first()
-            if exists:
-                skipped += 1
                 continue
 
             age = int(raw.get("age", 25))
 
-            profile = Profile(
-                name=name,
-                gender=str(raw.get("gender", "male")).lower(),
-                gender_probability=float(raw.get("gender_probability", 0.9)),
-                age=age,
-                age_group=get_age_group(age),
-                country_id=str(raw.get("country_id", "NG")).upper(),
-                country_name=str(raw.get("country_name", "Nigeria")),
-                country_probability=float(raw.get("country_probability", 0.8)),
-                created_at=datetime.now(timezone.utc),
-            )
+            batch.append({
+                "id": raw.get("id") or str(uuid7()),
+                "name": name,
+                "gender": str(raw.get("gender", "male")).lower(),
+                "gender_probability": float(raw.get("gender_probability", 0.9)),
+                "sample_size": int(raw.get("sample_size") or 0),
+                "age": age,
+                "age_group": get_age_group(age),
+                "country_id": str(raw.get("country_id", "NG")).upper(),
+                "country_name": str(raw.get("country_name", "Nigeria")),
+                "country_probability": float(raw.get("country_probability", 0.8)),
+                "created_at": datetime.now(timezone.utc),
+            })
 
-            db.add(profile)
-            inserted += 1
-
-            # Commit in batches of 200 to avoid memory issues with large datasets
-            if inserted % 200 == 0:
+            if len(batch) == 200:
+                stmt = insert(Profile).values(batch)
+                stmt = stmt.on_conflict_do_nothing(index_elements=["name"])
+                db.execute(stmt)
                 db.commit()
-                print(f"  ✅ {inserted} inserted so far...")
+                batch = []
+                print("✅ 200 inserted (duplicates ignored)")
 
-        db.commit()
+        if batch:
+            stmt = insert(Profile).values(batch)
+            stmt = stmt.on_conflict_do_nothing(index_elements=["name"])
+            db.execute(stmt)
+            db.commit()
 
     except Exception as e:
         db.rollback()
-        print(f"❌ Error during seeding: {e}")
+        print(f"❌ Error: {e}")
         raise
     finally:
         db.close()
 
-    print(f"\n✅ Seeding complete.")
-    print(f"   Inserted : {inserted}")
-    print(f"   Skipped  : {skipped} (already existed or empty name)")
-    print(f"   Total    : {inserted + skipped}")
+    print("✅ Seeding complete (duplicates safely ignored)")
 
 
 if __name__ == "__main__":

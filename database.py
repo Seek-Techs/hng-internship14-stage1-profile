@@ -16,8 +16,11 @@ if not DATABASE_URL:
 
 # Heroku and some other platforms still supply the old postgres:// scheme
 # SQLAlchemy 1.4+ requires postgresql:// — fix it silently
-if DATABASE_URL.startswith("postgres://"):
-    DATABASE_URL = DATABASE_URL.replace("postgres://", "postgresql://", 1)
+# if DATABASE_URL.startswith("postgres://"):
+#     DATABASE_URL = DATABASE_URL.replace("postgres://", "postgresql://", 1)
+
+if DATABASE_URL.startswith("postgresql://"):
+    DATABASE_URL = DATABASE_URL.replace("postgresql://", "postgresql+psycopg2://", 1)
 
 # SQLite needs check_same_thread=False for FastAPI's threading model
 # PostgreSQL does not need (or accept) this argument
@@ -27,7 +30,8 @@ if DATABASE_URL.startswith("sqlite"):
         connect_args={"check_same_thread": False},
         pool_size=5,        # maintain 5 persistent connections
         max_overflow=10,    # allow 10 extra connections under load
-        pool_timeout=30,    # wait max 30s for a connection
+        pool_timeout=30, 
+        pool_recycle=300,   # wait max 30s for a connection
         pool_pre_ping=True, # test connection health before using it
     )
 else:
@@ -91,7 +95,9 @@ class Profile(Base):
         Index("ix_profiles_gender_country", "gender", "country_id"),
     )
 
-Base.metadata.create_all(bind=engine)
+# Base.metadata.create_all(bind=engine)
+def init_db():
+    Base.metadata.create_all(bind=engine)
 
 
 def get_db():
