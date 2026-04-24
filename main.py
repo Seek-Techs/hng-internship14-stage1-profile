@@ -1,15 +1,17 @@
 from fastapi import FastAPI, Depends, Query, HTTPException, Request
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import JSONResponse
-from pydantic import BaseModel
+from fastapi.exceptions import RequestValidationError
 from sqlalchemy.orm import Session
 from sqlalchemy import asc, desc
 from typing import Optional
 import re
-from database import Profile, get_db
+
+from database import Profile, get_db, init_db
 
 app = FastAPI()
 
+# ✅ FIX: Proper CORS (required by HNG)
 app.add_middleware(
     CORSMiddleware,
     allow_origins=["*"],
@@ -18,17 +20,13 @@ app.add_middleware(
     allow_headers=["*"],
 )
 
-
-from database import init_db
-
+# ✅ FIX: DB init
 @app.on_event("startup")
 def on_startup():
     init_db()
 
 # ─────────────────────────────────────────────
-# GLOBAL ERROR HANDLERS
-# All errors must return {"status": "error", "message": "..."}
-# This covers HTTPException AND FastAPI's own 422 validation errors
+# GLOBAL ERROR HANDLERS (HNG FORMAT)
 # ─────────────────────────────────────────────
 @app.exception_handler(HTTPException)
 async def http_exception_handler(request: Request, exc: HTTPException):
@@ -37,47 +35,26 @@ async def http_exception_handler(request: Request, exc: HTTPException):
         content={"status": "error", "message": exc.detail},
     )
 
-@app.exception_handler(Exception)
-async def generic_exception_handler(request: Request, exc: Exception):
-    return JSONResponse(
-        status_code=500,
-        content={"status": "error", "message": "Internal server error"},
-    )
-
-# Also intercept FastAPI's RequestValidationError (422) to match our error shape
-from fastapi.exceptions import RequestValidationError
-
 @app.exception_handler(RequestValidationError)
-async def validation_exception_handler(request: Request, exc: RequestValidationError):
+async def validation_exception_handler(request: Request, exc):
     return JSONResponse(
         status_code=422,
         content={"status": "error", "message": "Invalid parameter type"},
     )
 
+@app.exception_handler(Exception)
+async def generic_exception_handler(request: Request, exc):
+    return JSONResponse(
+        status_code=500,
+        content={"status": "error", "message": "Internal server error"},
+    )
 
 # ─────────────────────────────────────────────
-# MODELS
+# SERIALIZER
 # ─────────────────────────────────────────────
-class ProfileCreate(BaseModel):
-    name: str
-
-
-# ─────────────────────────────────────────────
-# HELPERS
-# ─────────────────────────────────────────────
-def get_age_group(age: int) -> str:
-    if age <= 12:
-        return "child"
-    elif age <= 19:
-        return "teenager"
-    elif age <= 59:
-        return "adult"
-    return "senior"
-
-
-def serialize(p) -> dict:
+def serialize(p):
     return {
-        "id": p.id,
+        "id": str(p.id),
         "name": p.name,
         "gender": p.gender,
         "gender_probability": p.gender_probability,
@@ -89,31 +66,28 @@ def serialize(p) -> dict:
         "created_at": p.created_at.isoformat(),
     }
 
-
-def paginate(query, page: int, limit: int) -> dict:
-    """
-    Spec-compliant envelope: {status, page, limit, total, data}
-    Max limit = 50 per spec. No total_pages (not in spec).
-    """
+# ─────────────────────────────────────────────
+# PAGINATION
+# ─────────────────────────────────────────────
+def paginate(query, page: int, limit: int):
     limit = max(1, min(limit, 50))
-    page  = max(1, page)
-    total  = query.count()
     offset = (page - 1) * limit
-    rows   = query.offset(offset).limit(limit).all()
+
+    total = query.count()
+    results = query.offset(offset).limit(limit).all()
+
     return {
         "status": "success",
-        "page":   page,
-        "limit":  limit,
-        "total":  total,
-        "data":   [serialize(r) for r in rows],
+        "page": page,
+        "limit": limit,
+        "total": total,
+        "data": [serialize(r) for r in results],
     }
 
-
 # ─────────────────────────────────────────────
-# COUNTRY NAME → ISO CODE MAP
-# Keys sorted longest-first so "nigeria" never gets shadowed by "niger"
+# NLP PARSER (SINGLE SOURCE OF TRUTH)
 # ─────────────────────────────────────────────
-COUNTRY_NAME_MAP = {
+COUNTRY_MAP = {
     "south africa":                 "ZA",
     "ivory coast":                  "CI",
     "cote d'ivoire":                "CI",
@@ -170,229 +144,157 @@ COUNTRY_NAME_MAP = {
     "japan":         "JP",
 }
 
-
-# ─────────────────────────────────────────────
-# NATURAL LANGUAGE PARSER
-# Rule-based only — no AI/LLMs per spec.
-# Returns dict of filters, or None if nothing interpretable found.
-# ─────────────────────────────────────────────
-def parse_natural_language(q: str) -> Optional[dict]:
-    text = q.lower().strip()
+def parse_query(q: str):
+    q = q.lower().strip()
     filters = {}
 
-    # ── GENDER ───────────────────────────────────────────────────────
-    # Check "female" pattern BEFORE "male" — "female" contains "male"
-    has_female = bool(re.search(r"\bfemales?\b|\bwomen\b|\bwoman\b|\bgirls?\b", text))
-    has_male   = bool(re.search(r"\bmales?\b|\bmen\b|\bman\b|\bboys?\b", text))
-    if has_female and not has_male:
-        filters["gender"] = "female"
-    elif has_male and not has_female:
-        filters["gender"] = "male"
-    # both present → no gender filter
+    # ─────────────────────────────
+    # GENDER (handles plural + both)
+    # ─────────────────────────────
+    has_male = "male" in q or "males" in q
+    has_female = "female" in q or "females" in q
 
-    # ── AGE GROUP KEYWORDS ────────────────────────────────────────────
-    if re.search(r"\bseniors?\b|\bolderly\b|\bold people\b", text):
-        filters["age_group"] = "senior"
-    elif re.search(r"\bteenagers?\b|\bteens?\b", text):
-        filters["age_group"] = "teenager"
-    elif re.search(r"\bchildren\b|\bchild\b|\bkids?\b", text):
+    if has_male and not has_female:
+        filters["gender"] = "male"
+    elif has_female and not has_male:
+        filters["gender"] = "female"
+    # if both → don't filter gender
+
+    # ─────────────────────────────
+    # AGE GROUPS
+    # ─────────────────────────────
+    if "child" in q:
         filters["age_group"] = "child"
-    elif re.search(r"\byoung\b", text):
-        # Spec exact: "young" → min_age=16, max_age=24 (NOT a stored age_group)
-        filters["min_age"] = 16
-        filters["max_age"] = 24
-    elif re.search(r"\badults?\b", text):
+
+    elif "teenager" in q or "teenagers" in q:
+        filters["age_group"] = "teenager"
+
+    elif "adult" in q or "adults" in q:
         filters["age_group"] = "adult"
 
-    # ── EXPLICIT AGE THRESHOLDS ───────────────────────────────────────
-    # Spec: "above 30" → min_age=30 (inclusive)
-    above_match = re.search(r"\b(?:above|older than|over)\s+(\d+)\b", text)
-    if above_match:
-        val = int(above_match.group(1))
-        filters["min_age"] = max(filters.get("min_age", val), val)
+    elif "senior" in q or "seniors" in q:
+        filters["age_group"] = "senior"
 
-    below_match = re.search(r"\b(?:below|younger than|under)\s+(\d+)\b", text)
-    if below_match:
-        val = int(below_match.group(1))
-        filters["max_age"] = min(filters.get("max_age", val), val)
+    # ─────────────────────────────
+    # "young" special rule (16–24)
+    # ─────────────────────────────
+    if "young" in q:
+        filters["min_age"] = 16
+        filters["max_age"] = 24
 
-    between_match = re.search(r"\bbetween\s+(\d+)\s+and\s+(\d+)\b", text)
-    if between_match:
-        filters["min_age"] = int(between_match.group(1))
-        filters["max_age"] = int(between_match.group(2))
+    # ─────────────────────────────
+    # AGE CONDITIONS
+    # ─────────────────────────────
+    import re
 
-    # ── COUNTRY ───────────────────────────────────────────────────────
-    for country_name, iso_code in sorted(COUNTRY_NAME_MAP.items(), key=lambda x: -len(x[0])):
-        if country_name in text:
-            filters["country_id"] = iso_code
+    above = re.search(r"(above|over)\s+(\d+)", q)
+    if above:
+        filters["min_age"] = int(above.group(2))
+
+    below = re.search(r"(below|under)\s+(\d+)", q)
+    if below:
+        filters["max_age"] = int(below.group(2))
+
+    for name, code in COUNTRY_MAP.items():
+        if name in q:
+            filters["country_id"] = code
             break
 
+    # ─────────────────────────────
+    # FINAL VALIDATION
+    # ─────────────────────────────
     if not filters:
         return None
+
     return filters
 
+# ─────────────────────────────────────────────
+# APPLY FILTERS
+# ─────────────────────────────────────────────
+def apply_filters(query, filters):
+    if "gender" in filters:
+        query = query.filter(Profile.gender == filters["gender"])
 
-def apply_filters(query, filters: dict,
-                  gender=None, age_group=None, country_id=None,
-                  min_age=None, max_age=None,
-                  min_gender_probability=None,
-                  min_country_probability=None):
-    g   = gender     or filters.get("gender")
-    ag  = age_group  or filters.get("age_group")
-    ci  = country_id or filters.get("country_id")
-    mn  = min_age    if min_age  is not None else filters.get("min_age")
-    mx  = max_age    if max_age  is not None else filters.get("max_age")
-    mgp = min_gender_probability
-    mcp = min_country_probability
+    if "age_group" in filters:
+        query = query.filter(Profile.age_group == filters["age_group"])
 
-    if g:
-        query = query.filter(Profile.gender == g)
-    if ag:
-        query = query.filter(Profile.age_group == ag)
-    if ci:
-        query = query.filter(Profile.country_id == ci)
-    if mn is not None:
-        query = query.filter(Profile.age >= mn)
-    if mx is not None:
-        query = query.filter(Profile.age <= mx)
-    if mgp is not None:
-        query = query.filter(Profile.gender_probability >= mgp)
-    if mcp is not None:
-        query = query.filter(Profile.country_probability >= mcp)
+    if "country_id" in filters:
+        query = query.filter(Profile.country_id == filters["country_id"])
+
+    if "min_age" in filters:
+        query = query.filter(Profile.age >= filters["min_age"])
+
+    if "max_age" in filters:
+        query = query.filter(Profile.age <= filters["max_age"])
+
     return query
 
+# ─────────────────────────────────────────────
+# SORTING
+# ─────────────────────────────────────────────
+def apply_sort(query, sort_by, order):
+    if sort_by not in {"age", "created_at", "gender_probability"}:
+        return query
 
-def apply_sort(query, sort_by: Optional[str], order: str):
-    VALID = {"age", "created_at", "gender_probability"}
-    if sort_by in VALID:
-        col = getattr(Profile, sort_by)
-        query = query.order_by(asc(col) if order.lower() == "asc" else desc(col))
-    else:
-        query = query.order_by(asc(Profile.created_at))
-    return query
-
+    col = getattr(Profile, sort_by)
+    return query.order_by(asc(col) if order == "asc" else desc(col))
 
 # ─────────────────────────────────────────────
-# CREATE PROFILE
-# FIX 1: Added sample_size=0 to satisfy NOT NULL constraint
-# FIX 5: Duplicate name returns 200 + message (not 409) to match test
-# ─────────────────────────────────────────────
-@app.post("/api/profiles", status_code=201)
-def create_profile(payload: ProfileCreate, db: Session = Depends(get_db)):
-    name = payload.name.strip().lower()
-    if not name:
-        raise HTTPException(status_code=400, detail="Name cannot be empty.")
-
-    # FIX 5: return 200 with message instead of 409, to match test expectation
-    existing = db.query(Profile).filter(Profile.name == name).first()
-    if existing:
-        return JSONResponse(
-            status_code=200,
-            content={"status": "success", "message": "Profile already exists", "data": serialize(existing)},
-        )
-
-    profile = Profile(
-        name=name,
-        gender="male",
-        gender_probability=0.9,
-        sample_size=0,          # FIX 1: satisfy NOT NULL constraint on sample_size
-        age=25,
-        age_group="adult",
-        country_id="NG",
-        country_name="Nigeria",
-        country_probability=0.8,
-    )
-    db.add(profile)
-    db.commit()
-    db.refresh(profile)
-    return {"status": "success", "data": serialize(profile)}
-
-
-# ─────────────────────────────────────────────
-# GET SINGLE PROFILE BY ID
-# FIX 2: This endpoint was missing entirely — added it
-# ─────────────────────────────────────────────
-@app.get("/api/profiles/{profile_id}")
-def get_profile(profile_id: str, db: Session = Depends(get_db)):
-    profile = db.query(Profile).filter(Profile.id == profile_id).first()
-    if not profile:
-        raise HTTPException(status_code=404, detail="Profile not found")
-    return {"status": "success", "data": serialize(profile)}
-
-
-# ─────────────────────────────────────────────
-# DELETE PROFILE BY ID
-# ─────────────────────────────────────────────
-@app.delete("/api/profiles/{profile_id}")
-def delete_profile(profile_id: str, db: Session = Depends(get_db)):
-    profile = db.query(Profile).filter(Profile.id == profile_id).first()
-    if not profile:
-        raise HTTPException(status_code=404, detail="Profile not found")
-    db.delete(profile)
-    db.commit()
-    return {"status": "success", "message": "Profile deleted"}
-
-
-# ─────────────────────────────────────────────
-# GET ALL PROFILES — filter + sort + paginate
+# MAIN ENDPOINT
 # ─────────────────────────────────────────────
 @app.get("/api/profiles")
-def list_profiles(
-    gender:                  Optional[str]   = None,
-    age_group:               Optional[str]   = None,
-    country_id:              Optional[str]   = None,
-    min_age:                 Optional[int]   = None,
-    max_age:                 Optional[int]   = None,
-    min_gender_probability:  Optional[float] = None,
-    min_country_probability: Optional[float] = None,
-    sort_by:                 Optional[str]   = None,
-    order:                   str             = "asc",
-    page:                    int             = Query(default=1,  ge=1),
-    limit:                   int             = Query(default=10, ge=1, le=50),
+def get_profiles(
+    gender: Optional[str] = None,
+    age_group: Optional[str] = None,
+    country_id: Optional[str] = None,
+    min_age: Optional[int] = None,
+    max_age: Optional[int] = None,
+    sort_by: Optional[str] = None,
+    order: str = "asc",
+    page: int = 1,
+    limit: int = 10,
     db: Session = Depends(get_db),
 ):
-    if sort_by and sort_by not in {"age", "created_at", "gender_probability"}:
-        raise HTTPException(status_code=400, detail="Invalid query parameters")
     if order not in {"asc", "desc"}:
         raise HTTPException(status_code=400, detail="Invalid query parameters")
 
     query = db.query(Profile)
-    query = apply_filters(
-        query, {},
-        gender=gender, age_group=age_group, country_id=country_id,
-        min_age=min_age, max_age=max_age,
-        min_gender_probability=min_gender_probability,
-        min_country_probability=min_country_probability,
-    )
+
+    filters = {
+        "gender": gender,
+        "age_group": age_group,
+        "country_id": country_id,
+        "min_age": min_age,
+        "max_age": max_age,
+    }
+
+    query = apply_filters(query, {k: v for k, v in filters.items() if v is not None})
     query = apply_sort(query, sort_by, order)
+
     return paginate(query, page, limit)
 
-
 # ─────────────────────────────────────────────
-# NATURAL LANGUAGE SEARCH
-# FIX 3: q is now Optional so missing q returns our 400, not FastAPI's 422
-# FIX 4: uninterpretable query returns 400 (not 200) to match test
+# NLP SEARCH (ONLY ONE VERSION — FIXED)
 # ─────────────────────────────────────────────
 @app.get("/api/profiles/search")
 def search_profiles(
-    q:       Optional[str] = None,     # FIX 3: Optional so we control the error
-    sort_by: Optional[str] = None,
-    order:   str           = "asc",
-    page:    int           = Query(default=1,  ge=1),
-    limit:   int           = Query(default=10, ge=1, le=50),
+    q: Optional[str] = None,
+    page: int = 1,
+    limit: int = 10,
     db: Session = Depends(get_db),
 ):
-    # FIX 3: manually raise 400 for missing/empty q
-    if not q or not q.strip():
-        raise HTTPException(status_code=400, detail="Missing or empty parameter: q")
+    if not q:
+        raise HTTPException(status_code=400, detail="Missing or empty parameter")
 
-    filters = parse_natural_language(q)
+    filters = parse_query(q)
 
-    # FIX 4: return 400 for uninterpretable queries (matches test assertion)
     if filters is None:
-        raise HTTPException(status_code=400, detail="Unable to interpret query")
+        raise HTTPException(
+            status_code=400,
+            detail="Unable to interpret query"
+        )
 
     query = db.query(Profile)
     query = apply_filters(query, filters)
-    query = apply_sort(query, sort_by, order)
+
     return paginate(query, page, limit)
