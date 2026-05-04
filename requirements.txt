@@ -6,4 +6,5 @@ psycopg2-binary
 python-dotenv
 uuid6
 pytest
+click
 # cache-bust-202604242111
