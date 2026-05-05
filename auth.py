@@ -5,8 +5,10 @@ from datetime import datetime, timedelta, timezone
 from jose import jwt
 from fastapi import HTTPException, status, Request, Depends
 from uuid6 import uuid7
+from fastapi.security import HTTPBearer, HTTPAuthorizationCredentials
 
-from database import SessionLocal, User
+from database import SessionLocal
+from models import User
 
 # ENV
 GITHUB_CLIENT_ID = os.getenv("GITHUB_CLIENT_ID")
@@ -22,6 +24,40 @@ FRONTEND_URL = os.getenv("FRONTEND_URL", "*")
 
 # 🔥 OAuth state store (with expiry)
 oauth_states = {}
+
+security = HTTPBearer()
+
+def get_current_user(
+    credentials: HTTPAuthorizationCredentials = Depends(security)
+):
+    token = credentials.credentials
+    payload = decode_token(token)
+
+    if not payload:
+        raise HTTPException(status_code=401, detail="Invalid token")
+
+    user_id = payload.get("sub")
+
+    db = SessionLocal()
+    user = db.query(User).filter(User.id == user_id).first()
+    db.close()
+
+    if not user:
+        raise HTTPException(status_code=401, detail="User not found")
+
+    return user
+
+
+def require_admin(user: User = Depends(get_current_user)):
+    if user.role != "admin":
+        raise HTTPException(status_code=403, detail="Admin access required")
+    return user
+
+
+def require_analyst(user: User = Depends(get_current_user)):
+    if user.role not in ["admin", "analyst"]:
+        raise HTTPException(status_code=403, detail="Analyst access required")
+    return user
 
 
 def generate_state():
