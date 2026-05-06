@@ -12,6 +12,8 @@ import time
 
 from database import SessionLocal
 from models import User
+from dotenv import load_dotenv
+load_dotenv()
 
 
 # ENV
@@ -28,7 +30,7 @@ FRONTEND_URL = os.getenv("FRONTEND_URL", "*")
 JWT_SECRET = os.getenv("JWT_SECRET")
 
 # 🔥 OAuth state store (with expiry)
-
+# oauth_states = {}
 
 security = HTTPBearer()
 
