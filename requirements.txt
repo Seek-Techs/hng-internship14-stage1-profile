@@ -8,4 +8,5 @@ uuid6
 pytest
 click
 slowapi
+python-jose
 # cache-bust-202604242111
