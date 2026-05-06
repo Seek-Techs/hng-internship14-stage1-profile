@@ -7,4 +7,5 @@ python-dotenv
 uuid6
 pytest
 click
+slowapi
 # cache-bust-202604242111
