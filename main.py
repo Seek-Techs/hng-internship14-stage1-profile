@@ -123,17 +123,14 @@ oauth_states = {}
 @limiter.limit("20/minute")
 async def login(request: Request):
     state = generate_state()
-    oauth_states[state] = datetime.now(timezone.utc)
     return RedirectResponse(get_github_login_url(state))
 
 
 @app.get("/auth/callback")
 async def callback(code: str, state: str, request: Request, db: Session = Depends(get_db)):
 
-    if state not in oauth_states:
-        raise HTTPException(status_code=400, detail="Invalid state")
-
-    del oauth_states[state]
+    # ✅ VALIDATE STATE (stateless)
+    verify_state(state)
 
     token_data = await exchange_code_for_token(code)
     github_token = token_data.get("access_token")
@@ -142,21 +139,16 @@ async def callback(code: str, state: str, request: Request, db: Session = Depend
         raise HTTPException(status_code=400, detail="GitHub auth failed")
 
     github_user = await get_github_user(github_token)
-    user = get_or_create_user(github_user, db)
+    user = get_or_create_user(db, github_user)
 
     access_token = create_access_token(user.id, user.role)
     refresh_token = create_refresh_token(user.id)
 
-    # CLI vs WEB
-    user_agent = request.headers.get("user-agent", "").lower()
-
-    if "mozilla" in user_agent:
-        response = RedirectResponse(url="/dashboard")
-        response.set_cookie("access_token", access_token, httponly=True)
-        response.set_cookie("refresh_token", refresh_token, httponly=True)
-        return response
+    user.refresh_token = refresh_token
+    db.commit()
 
     return {
+        "status": "success",
         "access_token": access_token,
         "refresh_token": refresh_token,
         "expires_in": 900

@@ -2,13 +2,17 @@ import os
 import secrets
 import httpx
 from datetime import datetime, timedelta, timezone
-from jose import jwt
+from jose import jwt, JWTError
 from fastapi import HTTPException, status, Request, Depends
 from uuid6 import uuid7
 from fastapi.security import HTTPBearer, HTTPAuthorizationCredentials
 
+import jwt
+import time
+
 from database import SessionLocal
 from models import User
+
 
 # ENV
 GITHUB_CLIENT_ID = os.getenv("GITHUB_CLIENT_ID")
@@ -21,9 +25,10 @@ ALGORITHM = "HS256"
 ACCESS_TOKEN_EXPIRE_MINUTES = 15
 REFRESH_TOKEN_EXPIRE_DAYS = 7
 FRONTEND_URL = os.getenv("FRONTEND_URL", "*")
+JWT_SECRET = os.getenv("JWT_SECRET")
 
 # 🔥 OAuth state store (with expiry)
-oauth_states = {}
+
 
 security = HTTPBearer()
 
@@ -61,9 +66,12 @@ def require_analyst(user: User = Depends(get_current_user)):
 
 
 def generate_state():
-    state = secrets.token_urlsafe(16)
-    oauth_states[state] = datetime.now(timezone.utc)
-    return state
+    payload = {
+        "exp": int(time.time()) + 300,  # expires in 5 minutes
+        "iat": int(time.time()),
+        "nonce": secrets.token_urlsafe(16)
+    }
+    return jwt.encode(payload, JWT_SECRET, algorithm="HS256")
 
 
 def validate_state(state: str):
@@ -181,3 +189,10 @@ def verify_csrf(request: Request):
 
     if not cookie or not header or cookie != header:
         raise HTTPException(status_code=403, detail="CSRF failed")
+
+def verify_state(state: str):
+    try:
+        payload = jwt.decode(state, JWT_SECRET, algorithms=["HS256"])
+        return payload
+    except JWTError:
+        raise HTTPException(status_code=400, detail="Invalid or expired state")
