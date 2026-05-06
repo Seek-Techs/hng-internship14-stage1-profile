@@ -128,31 +128,42 @@ async def login(request: Request):
 
 @app.get("/auth/callback")
 async def callback(code: str, state: str, request: Request, db: Session = Depends(get_db)):
+    try:
+        verify_state(state)
 
-    # ✅ VALIDATE STATE (stateless)
-    verify_state(state)
+        token_data = await exchange_code_for_token(code)
+        if not token_data:
+            raise HTTPException(status_code=400, detail="Token exchange failed")
 
-    token_data = await exchange_code_for_token(code)
-    github_token = token_data.get("access_token")
+        github_token = token_data.get("access_token")
+        if not github_token:
+            raise HTTPException(status_code=400, detail="No GitHub token")
 
-    if not github_token:
-        raise HTTPException(status_code=400, detail="GitHub auth failed")
+        github_user = await get_github_user(github_token)
+        if not github_user:
+            raise HTTPException(status_code=400, detail="Failed to fetch GitHub user")
 
-    github_user = await get_github_user(github_token)
-    user = get_or_create_user(db, github_user)
+        # ✅ VERY IMPORTANT
+        user = get_or_create_user(db, github_user)
 
-    access_token = create_access_token(user.id, user.role)
-    refresh_token = create_refresh_token(user.id)
+        access_token = create_access_token(user.id, user.role)
+        refresh_token = create_refresh_token(user.id)
 
-    user.refresh_token = refresh_token
-    db.commit()
+        # Optional (only if column exists)
+        if hasattr(user, "refresh_token"):
+            user.refresh_token = refresh_token
+            db.commit()
 
-    return {
-        "status": "success",
-        "access_token": access_token,
-        "refresh_token": refresh_token,
-        "expires_in": 900
-    }
+        return {
+            "status": "success",
+            "access_token": access_token,
+            "refresh_token": refresh_token,
+            "expires_in": 900
+        }
+
+    except Exception as e:
+        print("🔥 CALLBACK ERROR:", str(e))
+        raise HTTPException(status_code=500, detail=str(e))
 
 @app.post("/auth/refresh")
 def refresh(payload: RefreshRequest, db: Session = Depends(get_db)):
