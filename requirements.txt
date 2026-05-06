@@ -9,4 +9,5 @@ pytest
 click
 slowapi
 python-jose
+PyJWT
 # cache-bust-202604242111

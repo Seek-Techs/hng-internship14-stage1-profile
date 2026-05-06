@@ -7,7 +7,7 @@ from fastapi import HTTPException, status, Request, Depends
 from uuid6 import uuid7
 from fastapi.security import HTTPBearer, HTTPAuthorizationCredentials
 
-import jwt
+# import jwt
 import time
 
 from database import SessionLocal
