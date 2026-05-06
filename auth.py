@@ -147,26 +147,27 @@ def decode_token(token: str):
         raise HTTPException(status_code=401, detail="Invalid token")
 
 
-def get_or_create_user(github_user: dict):
-    db = SessionLocal()
-    try:
-        user = db.query(User).filter(User.github_id == str(github_user["id"])).first()
+def get_or_create_user(github_user, db):
+    user = db.query(User).filter(
+        User.github_id == github_user["id"]
+    ).first()
 
-        if not user:
-            user = User(
-                id=str(uuid7()),
-                github_id=str(github_user["id"]),
-                username=github_user.get("login"),
-                role="analyst"
-            )
-            db.add(user)
-            db.commit()
-            db.refresh(user)
-
+    if user:
         return user
-    finally:
-        db.close()
 
+    user = User(
+        github_id=github_user["id"],
+        github_username=github_user.get("login"),
+        email=github_user.get("email"),
+        avatar_url=github_user.get("avatar_url"),
+        role="analyst"
+    )
+
+    db.add(user)
+    db.commit()
+    db.refresh(user)
+
+    return user
 
 # 🔐 Cookie auth
 def get_current_user_from_cookie(request: Request):
