@@ -33,11 +33,17 @@ from auth import (
     generate_state, get_or_create_user
 )
 from auth import verify_state
+from dotenv import load_dotenv
+load_dotenv()
 
 # =========================
 # ENV
 # =========================
 FRONTEND_URL = os.getenv("FRONTEND_URL", "*")
+GITHUB_CLIENT_ID = os.getenv("GITHUB_CLIENT_ID")
+GITHUB_CLIENT_SECRET = os.getenv("GITHUB_CLIENT_SECRET")
+REDIRECT_URI = os.getenv("REDIRECT_URI")
+BASE_URL = os.getenv("BASE_URL")
 
 # =========================
 # APP INIT (MUST COME FIRST)
